@@ -1,0 +1,121 @@
+name: app-ci
+# 可复用构建模板：任何仓库一行 uses 即可获得与平台一致的
+# build(GHCR) → trivy 扫描 → cosign 签名 → 自动改 k8s-platform 的 newTag
+#
+# 用法（在应用源码仓 .github/workflows/ci.yml 里）：
+#   jobs:
+#     deploy:
+#       uses: byte-marvel/k8s-platform/.github/workflows/app-ci.yml@main
+#       with:
+#         app: <应用名>            # = k8s-platform 的 apps/<app> 目录名 = GHCR 包名
+#       secrets:
+#         DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}   # 跨仓改 newTag 的令牌
+on:
+  workflow_call:
+    inputs:
+      app:
+        description: 应用名（k8s-platform apps/<app> 目录名）
+        required: true
+        type: string
+      image:
+        description: 完整镜像名（不含 tag）；缺省 ghcr.io/byte-marvel/<app>
+        required: false
+        type: string
+      context:
+        description: Docker 构建上下文（应用仓内路径），缺省仓库根
+        required: false
+        type: string
+        default: '.'
+      dockerfile:
+        description: Dockerfile 路径（相对构建上下文）
+        required: false
+        type: string
+        default: 'Dockerfile'
+    secrets:
+      DEPLOY_TOKEN:
+        description: fine-grained PAT（只授权 k8s-platform 仓 contents:write）。同仓调用可不传。
+        required: false
+
+permissions:
+  contents: write   # 提交 newTag（同仓模式）
+  packages: write   # 推 GHCR
+  id-token: write   # cosign keyless 签名
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      APP: ${{ inputs.app }}
+      IMAGE: ${{ inputs.image || format('ghcr.io/byte-marvel/{0}', inputs.app) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 计算镜像 tag（短 sha）
+        id: ver
+        run: echo "tag=sha-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: 准备 buildx（docker-container 驱动，支持 GHA 缓存）
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 构建并推送镜像
+        id: push
+        uses: docker/build-push-action@v6
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.context }}/${{ inputs.dockerfile }}
+          push: true
+          load: true   # 镜像留在 runner 本地，trivy 直接扫本地，无需 registry 凭据
+          tags: |
+            ${{ env.IMAGE }}:${{ env.TAG }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trivy 扫描（CRITICAL 阻断，只报有修复版本的；扫 runner 本地镜像）
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v trivy-cache:/root/.cache \
+            aquasec/trivy:0.75.0 image \
+            --severity CRITICAL --ignore-unfixed --exit-code 1 \
+            "$IMAGE:$TAG"
+
+      - name: 安装 cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: cosign keyless 签名
+        run: cosign sign --yes "${IMAGE}@${{ steps.push.outputs.digest }}"
+
+      - name: 改 k8s-platform 的 newTag 并推送
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if [ -n "$DEPLOY_TOKEN" ]; then
+            # 跨仓模式：克隆 k8s-platform 用 DEPLOY_TOKEN 提交
+            git clone -q --depth 1 \
+              "https://x-access-token:${DEPLOY_TOKEN}@github.com/byte-marvel/k8s-platform.git" deploy-repo
+            cd deploy-repo
+          fi
+          sed -i -E "/^\s*-\s*name:\s*${APP}\s*$/,/newTag:/ s#(newTag:).*#\1 ${TAG}#" apps/${APP}/kustomization.yaml
+          grep -q "newTag: ${TAG}$" apps/${APP}/kustomization.yaml \
+            || { echo "k8s-platform 里没找到 apps/${APP} 的 name: ${APP} images 项，先建清单目录"; exit 1; }
+          if git diff --quiet; then
+            echo "tag 已是目标值，跳过"
+          else
+            git commit -am "deploy: ${APP} -> ${TAG} (run ${{ github.run_id }}) [skip ci]"
+            git push
+          fi
