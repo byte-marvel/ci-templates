@@ -98,10 +98,21 @@ jobs:
         id: ver
         run: echo "tag=sha-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
 
-      - name: 准备 buildx（指定持久 builder 则复用，否则自动创建）
+      - name: 生成 buildkit mirror 配置（self-hosted 构建层拉取走国内 mirror）
+        if: inputs.runs_on == 'self-hosted'
+        run: |
+          cat > buildkitd.toml <<'EOF'
+          [registry."docker.io"]
+            mirrors = ["mirror.ccs.tencentyun.com"]
+          [registry."ghcr.io"]
+            mirrors = ["ghcr.1ms.run"]
+          EOF
+
+      - name: 准备 buildx（self-hosted 传入 config，确保重建时也带 mirror）
         uses: docker/setup-buildx-action@v3
         with:
           name: ${{ inputs.buildx_builder }}
+          buildkitd-config: ${{ inputs.runs_on == 'self-hosted' && 'buildkitd.toml' || '' }}
 
       - name: 登录 GHCR
         if: inputs.push_ghcr
