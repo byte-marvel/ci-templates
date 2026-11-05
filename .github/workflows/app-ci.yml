@@ -156,11 +156,14 @@ jobs:
       - name: Trivy 扫描（CRITICAL 阻断，只报有修复版本的；扫 runner 本地镜像）
         env:
           TAG: ${{ steps.ver.outputs.tag }}
+          # self-hosted 国内节点：默认的 mirror.gcr.io 跨境超时，改走腾讯内网 docker hub mirror
+          DB_REPO: ${{ inputs.runs_on == 'self-hosted' && 'mirror.ccs.tencentyun.com/aquasec/trivy-db:2' || 'mirror.gcr.io/aquasec/trivy-db:2' }}
         run: |
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v trivy-cache:/root/.cache \
             aquasec/trivy:0.75.0 image \
+            --db-repository "$DB_REPO" \
             --severity CRITICAL --ignore-unfixed --exit-code 1 \
             "$SCAN_IMAGE:$TAG"
 
