@@ -58,6 +58,8 @@ jobs:
     env:
       APP: ${{ inputs.app }}
       IMAGE: ${{ inputs.image || format('ghcr.io/byte-marvel/{0}', inputs.app) }}
+      # secrets 不能直接用于 step 的 if，经 env 中转判断
+      TCR_PASSWORD: ${{ secrets.TCR_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
 
@@ -76,7 +78,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: 登录 TCR（国内分发副本；TCR_PASSWORD 未配置时跳过）
-        if: secrets.TCR_PASSWORD != ''
+        if: env.TCR_PASSWORD != ''
         uses: docker/login-action@v3
         with:
           registry: ccr.ccs.tencentyun.com
@@ -102,7 +104,7 @@ jobs:
       # 集群在国内，拉 GHCR 走跨境链路极慢，双推一份到 TCR 供集群拉取。
       # 命中 gha 缓存，此步只做推送。TCR_PASSWORD 未配置时跳过。
       - name: 双推 TCR（国内分发）
-        if: secrets.TCR_PASSWORD != ''
+        if: env.TCR_PASSWORD != ''
         uses: docker/build-push-action@v6
         with:
           context: ${{ inputs.context }}
