@@ -39,11 +39,14 @@ jobs:
 | `image` | — | 完整镜像名（不含 tag），缺省 `ghcr.io/byte-marvel/<app>` |
 | `context` | — | 构建上下文路径，缺省仓库根 |
 | `dockerfile` | — | Dockerfile 路径（相对 context），缺省 `Dockerfile` |
-| `tcr_namespace` | — | TCR 个人版命名空间；配 secrets `TCR_USER`/`TCR_PASSWORD` 启用双推 |
+| `tcr_namespace` | — | TCR 个人版命名空间；配 secrets `TCR_USER`/`TCR_PASSWORD` 启用 TCR 推送 |
+| `runs_on` | — | `ubuntu-latest`（默认，境外）或 `self-hosted`（国内节点，只推 TCR） |
+| `push_ghcr` | — | 是否推 GHCR（默认 true；self-hosted 模式应设 false） |
+| `buildx_builder` | — | self-hosted 模式复用的持久 buildx builder 名 |
 
 ## Secret
 
 | secret | 说明 |
 |---|---|
 | `DEPLOY_TOKEN` | fine-grained PAT，只授权 `byte-marvel/k8s-platform` 仓 Contents Read/Write。不传时镜像照常发布（`:latest`），仅跳过自动改 `newTag` |
-| `TCR_USER` / `TCR_PASSWORD` | 腾讯云 TCR 个人版访问凭证。配合 input `tcr_namespace` 启用国内双推（集群拉 GHCR 跨境极慢）。不传则只推 GHCR |
+| `TCR_USER` / `TCR_PASSWORD` | 腾讯云 TCR 个人版访问凭证。配合 input `tcr_namespace` 启用 TCR 推送（集群拉 GHCR 跨境极慢）。self-hosted 模式必传 |

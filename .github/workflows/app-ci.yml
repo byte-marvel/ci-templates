@@ -1,6 +1,10 @@
 name: app-ci
 # 可复用构建模板：任何仓库一行 uses 即可获得与平台一致的
-# build(GHCR) → trivy 扫描 → cosign 签名 → 自动改 k8s-platform 的 newTag
+# build → trivy 扫描 → cosign 签名 → 自动改 k8s-platform 的 newTag
+#
+# 两种执行模式：
+#   ubuntu-latest（默认）：构建在境外 runner，推 GHCR（事实源）+ 可选双推 TCR
+#   self-hosted：构建在国内 runner，跳过 GHCR，只推 TCR；缓存走 TCR registry cache
 #
 # 用法（在应用源码仓 .github/workflows/ci.yml 里）：
 #   jobs:
@@ -32,7 +36,22 @@ on:
         type: string
         default: 'Dockerfile'
       tcr_namespace:
-        description: TCR 个人版命名空间；配合 secrets TCR_USER/TCR_PASSWORD 双推国内分发副本
+        description: TCR 个人版命名空间；配合 secrets TCR_USER/TCR_PASSWORD 启用 TCR 推送
+        required: false
+        type: string
+        default: ''
+      runs_on:
+        description: 执行 runner（ubuntu-latest=境外默认 / self-hosted=国内节点）
+        required: false
+        type: string
+        default: 'ubuntu-latest'
+      push_ghcr:
+        description: 是否推 GHCR（self-hosted 模式跨境推 GHCR 极慢，应设 false）
+        required: false
+        type: boolean
+        default: true
+      buildx_builder:
+        description: self-hosted 模式使用的持久 buildx builder 名（含 mirror 配置）；缺省自动创建
         required: false
         type: string
         default: ''
@@ -54,30 +73,45 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on }}
     env:
       APP: ${{ inputs.app }}
       IMAGE: ${{ inputs.image || format('ghcr.io/byte-marvel/{0}', inputs.app) }}
       # secrets 不能直接用于 step 的 if，经 env 中转判断
       TCR_PASSWORD: ${{ secrets.TCR_PASSWORD }}
+      # trivy/cosign 对准实际推送的 registry：推了 TCR 就用 TCR，否则 GHCR
+      SCAN_IMAGE: ${{ (inputs.tcr_namespace != '' && secrets.TCR_PASSWORD != '') && format('ccr.ccs.tencentyun.com/{0}/{1}', inputs.tcr_namespace, inputs.app) || format('ghcr.io/byte-marvel/{0}', inputs.app) }}
+      # self-hosted 缓存走 TCR registry cache（gha cache 从国内上传跨境极慢）；否则 gha
+      CACHE_REF: ${{ format('type=registry,ref=ccr.ccs.tencentyun.com/{0}/{1}:buildcache', inputs.tcr_namespace, inputs.app) }}
+      CACHE_FROM: ${{ inputs.runs_on == 'self-hosted' && format('type=registry,ref=ccr.ccs.tencentyun.com/{0}/{1}:buildcache', inputs.tcr_namespace, inputs.app) || 'type=gha' }}
+      CACHE_TO: ${{ inputs.runs_on == 'self-hosted' && format('type=registry,ref=ccr.ccs.tencentyun.com/{0}/{1}:buildcache,mode=max', inputs.tcr_namespace, inputs.app) || 'type=gha,mode=max' }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: 模式检查（self-hosted 必须 TCR 就绪）
+        if: inputs.runs_on == 'self-hosted' && (env.TCR_PASSWORD == '' || inputs.tcr_namespace == '')
+        run: |
+          echo "::error::self-hosted 模式必须提供 tcr_namespace 与 secrets TCR_USER/TCR_PASSWORD（只推 TCR，无 GHCR 兜底）"
+          exit 1
 
       - name: 计算镜像 tag（短 sha）
         id: ver
         run: echo "tag=sha-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
 
-      - name: 准备 buildx（docker-container 驱动，支持 GHA 缓存）
+      - name: 准备 buildx（指定持久 builder 则复用，否则自动创建）
         uses: docker/setup-buildx-action@v3
+        with:
+          name: ${{ inputs.buildx_builder }}
 
       - name: 登录 GHCR
+        if: inputs.push_ghcr
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 登录 TCR（国内分发副本；TCR_PASSWORD 未配置时跳过）
+      - name: 登录 TCR（国内分发；TCR_PASSWORD 未配置时跳过）
         if: env.TCR_PASSWORD != ''
         uses: docker/login-action@v3
         with:
@@ -85,7 +119,8 @@ jobs:
           username: ${{ secrets.TCR_USER }}
           password: ${{ secrets.TCR_PASSWORD }}
 
-      - name: 构建并推送镜像（GHCR = 事实源）
+      - name: 构建并推送 GHCR（事实源档案）
+        if: inputs.push_ghcr
         id: push
         uses: docker/build-push-action@v6
         env:
@@ -98,23 +133,25 @@ jobs:
           tags: |
             ${{ env.IMAGE }}:${{ env.TAG }}
             ${{ env.IMAGE }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: ${{ env.CACHE_FROM }}
+          cache-to: ${{ env.CACHE_TO }}
 
-      # 集群在国内，拉 GHCR 走跨境链路极慢，双推一份到 TCR 供集群拉取。
-      # 命中 gha 缓存，此步只做推送。TCR_PASSWORD 未配置时跳过。
-      - name: 双推 TCR（国内分发）
+      - name: 构建并推送 TCR（集群国内拉取）
         if: env.TCR_PASSWORD != ''
+        id: push_tcr
         uses: docker/build-push-action@v6
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
         with:
           context: ${{ inputs.context }}
           file: ${{ inputs.context }}/${{ inputs.dockerfile }}
           push: true
+          load: true   # trivy 扫描本地
           tags: |
             ccr.ccs.tencentyun.com/${{ inputs.tcr_namespace }}/${{ inputs.app }}:${{ steps.ver.outputs.tag }}
             ccr.ccs.tencentyun.com/${{ inputs.tcr_namespace }}/${{ inputs.app }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: ${{ env.CACHE_FROM }}
+          cache-to: ${{ env.CACHE_TO }}
 
       - name: Trivy 扫描（CRITICAL 阻断，只报有修复版本的；扫 runner 本地镜像）
         env:
@@ -125,13 +162,18 @@ jobs:
             -v trivy-cache:/root/.cache \
             aquasec/trivy:0.75.0 image \
             --severity CRITICAL --ignore-unfixed --exit-code 1 \
-            "$IMAGE:$TAG"
+            "$SCAN_IMAGE:$TAG"
 
       - name: 安装 cosign
         uses: sigstore/cosign-installer@v3
 
       - name: cosign keyless 签名
-        run: cosign sign --yes "${IMAGE}@${{ steps.push.outputs.digest }}"
+        run: |
+          if [ "${{ inputs.push_ghcr }}" = "true" ]; then
+            cosign sign --yes "${IMAGE}@${{ steps.push.outputs.digest }}"
+          else
+            cosign sign --yes "${SCAN_IMAGE}@${{ steps.push_tcr.outputs.digest }}"
+          fi
 
       - name: 改 k8s-platform 的 newTag 并推送
         env:
