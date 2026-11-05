@@ -5,7 +5,7 @@ name: app-ci
 # 用法（在应用源码仓 .github/workflows/ci.yml 里）：
 #   jobs:
 #     deploy:
-#       uses: byte-marvel/k8s-platform/.github/workflows/app-ci.yml@main
+#       uses: byte-marvel/ci-templates/.github/workflows/app-ci.yml@main
 #       with:
 #         app: <应用名>            # = k8s-platform 的 apps/<app> 目录名 = GHCR 包名
 #       secrets:
@@ -31,9 +31,20 @@ on:
         required: false
         type: string
         default: 'Dockerfile'
+      tcr_namespace:
+        description: TCR 个人版命名空间；配合 secrets TCR_USER/TCR_PASSWORD 双推国内分发副本
+        required: false
+        type: string
+        default: ''
     secrets:
       DEPLOY_TOKEN:
         description: fine-grained PAT（只授权 k8s-platform 仓 contents:write）。同仓调用可不传。
+        required: false
+      TCR_USER:
+        description: 腾讯云 TCR 个人版访问凭证用户名（集群从国内拉镜像）。不传则只推 GHCR。
+        required: false
+      TCR_PASSWORD:
+        description: 腾讯云 TCR 个人版访问凭证密码。
         required: false
 
 permissions:
@@ -64,7 +75,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 构建并推送镜像
+      - name: 登录 TCR（国内分发副本；TCR_PASSWORD 未配置时跳过）
+        if: secrets.TCR_PASSWORD != ''
+        uses: docker/login-action@v3
+        with:
+          registry: ccr.ccs.tencentyun.com
+          username: ${{ secrets.TCR_USER }}
+          password: ${{ secrets.TCR_PASSWORD }}
+
+      - name: 构建并推送镜像（GHCR = 事实源）
         id: push
         uses: docker/build-push-action@v6
         env:
@@ -77,6 +96,21 @@ jobs:
           tags: |
             ${{ env.IMAGE }}:${{ env.TAG }}
             ${{ env.IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # 集群在国内，拉 GHCR 走跨境链路极慢，双推一份到 TCR 供集群拉取。
+      # 命中 gha 缓存，此步只做推送。TCR_PASSWORD 未配置时跳过。
+      - name: 双推 TCR（国内分发）
+        if: secrets.TCR_PASSWORD != ''
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.context }}/${{ inputs.dockerfile }}
+          push: true
+          tags: |
+            ccr.ccs.tencentyun.com/${{ inputs.tcr_namespace }}/${{ inputs.app }}:${{ steps.ver.outputs.tag }}
+            ccr.ccs.tencentyun.com/${{ inputs.tcr_namespace }}/${{ inputs.app }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
