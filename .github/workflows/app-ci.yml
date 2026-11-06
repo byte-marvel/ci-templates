@@ -178,8 +178,13 @@ jobs:
             --severity CRITICAL --ignore-unfixed --exit-code 1 \
             "$SCAN_IMAGE:$TAG"
 
-      - name: 安装 cosign
+      - name: 安装 cosign（境外 runner 在线安装）
+        if: inputs.runs_on != 'self-hosted'
         uses: sigstore/cosign-installer@v3
+
+      - name: 校验预装 cosign（self-hosted 节点需预先装好 /usr/local/bin/cosign，避免跨境下载）
+        if: inputs.runs_on == 'self-hosted'
+        run: cosign version | head -1
 
       - name: cosign keyless 签名
         run: |
